@@ -1,24 +1,23 @@
 import { z } from "zod";
-import type { JsonValue } from "../jsonValue.js";
 import {
   sourceToBundleComparisonResultSchema,
   type SourceToBundleComparisonResult,
 } from "../javascript/sourceToBundleComparisonSchemas.js";
-import { err, ok, type Result } from "../result.js";
-import type { AnalysisError } from "../analysisErrorBase.js";
-import type {
-  AnalysisViewParent,
-  AnalysisViewRequest,
-  UnsignedAnalysisView,
-} from "./analysisView.js";
-import { analysisViewInputError } from "./analysisViewErrors.js";
+import { ok } from "../result.js";
+import type { AnalysisViewParent } from "./analysisViewParent.js";
+import {
+  ownedView,
+  type AdmittedView,
+  type SummaryAnalysisView,
+} from "./analysisViewShape.js";
+import { invalidAnalysisView } from "./analysisViewErrors.js";
 import { createAnalysisViewResultReader } from "./analysisViewParent.js";
 import {
-  boundedViewMessages,
+  boundedViewLimitations,
   completeWithinViewCoverage,
   pageViewCoverage,
 } from "./analysisViewCoverage.js";
-import { selectViewRows } from "./selectViewRows.js";
+import { pickFields, selectViewRows, filterSet } from "./selectViewRows.js";
 
 const mapping = sourceToBundleComparisonResultSchema.shape.items.element;
 const candidate = mapping.shape.candidates.element;
@@ -96,31 +95,17 @@ export const sourceToBundleViewContextSchema =
 const checkedReport = createAnalysisViewResultReader(
   sourceToBundleComparisonResultSchema,
 );
-const selected = (values: readonly string[] | undefined) =>
-  values === undefined ? undefined : new Set(values);
-const columns = (
-  row: object,
-  fields: readonly string[],
-): Record<string, JsonValue> => {
-  const source = row as Record<string, JsonValue>;
-  return Object.fromEntries(fields.map((field) => [field, source[field]!]));
-};
-
 /** Page facts owned by a complete comparison; page exhaustion does not upgrade source coverage. */
 export const projectSourceToBundleView = (
   parent: AnalysisViewParent,
-  view: AnalysisViewRequest,
-): Result<UnsignedAnalysisView, AnalysisError> => {
-  if (view.kind !== "summary" && view.kind !== "source-to-bundle")
-    return err(
-      analysisViewInputError([
-        {
-          path: ["view"],
-          reason: "invalid_value",
-          message:
-            "Source-to-bundle comparisons support summary and source-to-bundle pages",
-        },
-      ]),
+  admitted: AdmittedView,
+) => {
+  const view = ownedView<
+    SummaryAnalysisView | z.output<typeof sourceToBundleViewRequestSchema>
+  >(admitted, "summary", "source-to-bundle");
+  if (view === undefined)
+    return invalidAnalysisView(
+      "Source-to-bundle comparisons support summary and source-to-bundle pages",
     );
   const parsed = checkedReport(parent);
   if (!parsed.ok) return parsed;
@@ -142,26 +127,24 @@ export const projectSourceToBundleView = (
     parent_operation: "compare_source_to_bundle" as const,
     parent_digest: parent.evidenceId.slice(3),
     artifact: null,
-    limitations: boundedViewMessages(
-      [...parent.limitations, ...report.limitations],
-      parent.evidenceId,
-      "limitations",
-    ),
+    limitations: boundedViewLimitations(parent, report.limitations),
     unknowns: [
       "Candidate correspondence is not behavioral equivalence. Exhausting a selected page does not establish absence outside the examined inputs.",
     ],
   };
   if (view.kind === "summary")
     return ok({
-      kind: "summary",
+      kind: "summary" as const,
       view,
       ...shared,
       summary: context,
-      coverage: completeWithinViewCoverage(1, 1),
+      coverage: completeWithinViewCoverage(1),
     });
-  const paths = selected(view.source_paths),
-    ids = selected(view.mapping_ids),
-    statuses = selected(view.statuses);
+  const paths = filterSet(view.source_paths),
+    ids = filterSet(view.mapping_ids),
+    statuses = filterSet(view.statuses);
+  const filtered =
+    paths !== undefined || ids !== undefined || statuses !== undefined;
   const matches = (row: SourceToBundleComparisonResult["items"][number]) =>
     (paths === undefined || paths.has(row.source_path)) &&
     (ids === undefined || ids.has(row.mapping_id)) &&
@@ -183,9 +166,9 @@ export const projectSourceToBundleView = (
     const page = selectViewRows(
       report.items,
       view,
-      matches,
+      filtered ? matches : undefined,
       (row, source_index) => ({
-        ...columns(
+        ...pickFields(
           {
             ...row,
             source_index,
@@ -205,7 +188,7 @@ export const projectSourceToBundleView = (
     items = [];
     total = 0;
     for (const [source_index, row] of report.items.entries()) {
-      if (!matches(row)) continue;
+      if (filtered && !matches(row)) continue;
       const start = Math.max(0, view.offset - total);
       const end = Math.min(
         row.candidates.length,
@@ -220,7 +203,7 @@ export const projectSourceToBundleView = (
         ) {
           const candidate = row.candidates[candidate_index]!;
           items.push({
-            ...columns(candidate, fields),
+            ...pickFields(candidate, fields),
             mapping_id: row.mapping_id,
             source_path: row.source_path,
             source_index,
@@ -234,7 +217,7 @@ export const projectSourceToBundleView = (
     }
   }
   return ok({
-    kind: "source-to-bundle",
+    kind: "source-to-bundle" as const,
     view,
     ...shared,
     ...context,

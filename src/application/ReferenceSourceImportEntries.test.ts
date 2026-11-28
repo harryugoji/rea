@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import { expect, it } from "vitest";
 
 import { parseReferenceSourceEntries } from "./ReferenceSourceImportEntries.js";
-import { historicalSourceLanguages } from "../domain/referenceSourceGraph.js";
+import {
+  historicalSourceInventoryHasPartialFacts,
+  historicalSourceLanguages,
+} from "../domain/referenceSourceGraph.js";
 import type { ReferenceSourceRead } from "../reference/ReferenceSourceReaderTypes.js";
 
 it("projects an unsupported non-regular entry as unknown kind instead of file", () => {
@@ -92,10 +95,106 @@ it("keeps source entries when a module has an empty specifier", () => {
     "other.txt",
   ]);
   expect(parsed.relationships).toEqual([]);
-  expect(parsed.limitations).toEqual([
-    "Empty module specifier in main.mjs was not recorded as a relationship.",
+  expect(parsed.limitations).toHaveLength(1);
+  expect(parsed.limitations[0]).toContain("main.mjs");
+  expect(parsed.limitations[0]).toMatch(/empty.*specifier/iu);
+  expect(parsed.limitations[0]).toMatch(/not recorded.*relationship/iu);
+});
+
+it("resolves immediately invoked loaders from their proven source bases", () => {
+  const files = [
+    [
+      "main.cjs",
+      '(() => require)()("./dep.cjs"); (() => () => {})()("./local.cjs");',
+    ],
+    [
+      "main.mjs",
+      [
+        'import {createRequire} from "node:module";',
+        'createRequire(new URL("./sub/base.cjs", import.meta.url))("./dep.cjs");',
+        'createRequire(new URL("./sub/base.cjs", import.meta.url)).call(null, "./member.cjs");',
+      ].join("\n"),
+    ],
+    ["dep.cjs", ""],
+    ["sub/dep.cjs", ""],
+    ["member.cjs", ""],
+    ["sub/member.cjs", ""],
+  ] as const;
+  const parsed = parseReferenceSourceEntries(
+    {
+      root: "/selected/source",
+      entries: files.map(([path, content]) => ({
+        status: "read",
+        kind: "file",
+        path,
+        bytes: Buffer.from(content),
+        size: Buffer.byteLength(content),
+      })),
+      bytesRead: files.reduce(
+        (sum, [, content]) => sum + Buffer.byteLength(content),
+        0,
+      ),
+      limitations: [],
+    },
+    [],
+  );
+  expect(
+    parsed.relationships.filter(({ kind }) => kind === "requires"),
+  ).toEqual([
+    {
+      from_path: "main.cjs",
+      to: "dep.cjs",
+      kind: "requires",
+      resolution: "internal",
+      parse_state: "parsed",
+    },
+    {
+      from_path: "main.mjs",
+      to: "sub/dep.cjs",
+      kind: "requires",
+      resolution: "internal",
+      parse_state: "parsed",
+    },
   ]);
 });
+
+it.each([
+  ["function load(name) { require(name); }", true],
+  ["function load(args) { require.apply(null, args); }", true],
+  ["function load(require, name) { require(name); }", false],
+  ["require(7); require();", false],
+] as const)(
+  "reports unresolved CommonJS target coverage for %s",
+  (source, partial) => {
+    const bytes = Buffer.from(source);
+    const parsed = parseReferenceSourceEntries(
+      {
+        root: "/selected/source",
+        entries: [
+          {
+            status: "read",
+            kind: "file",
+            path: "main.cjs",
+            bytes,
+            size: bytes.length,
+          },
+        ],
+        bytesRead: bytes.length,
+        limitations: [],
+      },
+      [],
+    );
+    expect(parsed.relationships).toEqual([]);
+    expect(
+      historicalSourceInventoryHasPartialFacts({
+        ...parsed,
+        parse_failures: parsed.parseFailures,
+        exclusions: [],
+      }),
+    ).toBe(partial);
+    expect(parsed.entries[0]?.limitations).toEqual(parsed.limitations);
+  },
+);
 
 it("retains Kotlin source identity and language across the inventory projection", () => {
   const files = [
@@ -536,4 +635,130 @@ it("retains observed manifests and closer completed scopes inside a partial inve
       resolution: "internal",
     }),
   ]);
+});
+
+it("keeps ambiguous directory coverage unknown while honoring exact directory identity", () => {
+  const first = "a\u0301\u0323";
+  const second = "a\u0323\u0301";
+  const ambiguous = "\u1ea1\u0301";
+  const files = [
+    ["main.cjs", `require("./${ambiguous}/dep"); require("./${second}/dep");`],
+    [`${ambiguous}/dep.js`, "module.exports = 1;"],
+    [`${second}/dep.js`, "module.exports = 2;"],
+  ] as const;
+  const parsed = parseReferenceSourceEntries(
+    {
+      root: "/selected/source",
+      bytesRead: 0,
+      limitations: [],
+      entries: [
+        ...files.map(([path, content]) => ({
+          status: "read" as const,
+          kind: "file" as const,
+          path,
+          bytes: Buffer.from(content),
+          size: Buffer.byteLength(content),
+        })),
+        {
+          status: "failed",
+          kind: "directory",
+          path: first,
+          code: "io",
+          message: "Partial enumeration",
+        },
+        { status: "read", kind: "directory", path: second },
+      ],
+    },
+    [],
+  );
+  expect(parsed.relationships).toEqual([
+    expect.objectContaining({
+      to: `${ambiguous}/dep`,
+      resolution: "unresolved",
+    }),
+    expect.objectContaining({ to: `${second}/dep.js`, resolution: "internal" }),
+  ]);
+});
+
+it("does not skip an ambiguous higher priority file for an observed extension fallback", () => {
+  const first = "a\u0301\u0323";
+  const second = "a\u0323\u0301";
+  const ambiguous = "\u1ea1\u0301";
+  const files = [
+    ["main.cjs", `require("./${ambiguous}"); require("./${first}");`],
+    [first, "module.exports = 1;"],
+    [second, "module.exports = 2;"],
+    [`${ambiguous}.js`, "module.exports = 3;"],
+  ] as const;
+  const parsed = parseReferenceSourceEntries(
+    {
+      root: "/selected/source",
+      bytesRead: 0,
+      limitations: [],
+      entries: files.map(([path, content]) => ({
+        status: "read" as const,
+        kind: "file" as const,
+        path,
+        bytes: Buffer.from(content),
+        size: Buffer.byteLength(content),
+      })),
+    },
+    [],
+  );
+  expect(parsed.relationships).toEqual([
+    expect.objectContaining({ to: ambiguous, resolution: "unresolved" }),
+    expect.objectContaining({ to: first, resolution: "internal" }),
+  ]);
+});
+
+it("prefers a later exact filename over an earlier unique canonical candidate", () => {
+  const composed = "caf\u00e9";
+  const decomposed = "cafe\u0301";
+  const files = [
+    ["main.cjs", `require("./${composed}");`],
+    [decomposed, "module.exports = 1;"],
+    [`${composed}.js`, "module.exports = 2;"],
+  ] as const;
+  const parsed = parseReferenceSourceEntries(
+    {
+      root: "/selected/source",
+      bytesRead: 0,
+      limitations: [],
+      entries: files.map(([path, content]) => ({
+        status: "read" as const,
+        kind: "file" as const,
+        path,
+        bytes: Buffer.from(content),
+        size: Buffer.byteLength(content),
+      })),
+    },
+    [],
+  );
+  expect(parsed.relationships).toEqual([
+    expect.objectContaining({ to: `${composed}.js`, resolution: "internal" }),
+  ]);
+});
+
+it("retains a missing target's directory requirement when rebasing from the inventory root", () => {
+  const read: ReferenceSourceRead = {
+    root: "/selected",
+    entries: [
+      {
+        status: "read",
+        kind: "symlink",
+        path: "nested/link",
+        target: "sub/missing/",
+        targetState: "missing",
+      },
+    ],
+    bytesRead: 0,
+    limitations: [],
+  };
+  expect(parseReferenceSourceEntries(read, []).entries).toContainEqual(
+    expect.objectContaining({
+      path: "nested/link",
+      target: "../sub/missing/",
+      target_state: "missing",
+    }),
+  );
 });

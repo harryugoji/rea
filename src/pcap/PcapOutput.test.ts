@@ -1,9 +1,22 @@
+import { readFile } from "node:fs/promises";
+import { dnsResponseLayers } from "../../tests/fixtures/pcap/pcapTestTools.js";
 import { expect, it } from "vitest";
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
-import { parseCapinfosOutput, parseTsharkJsonOutput } from "./PcapOutput.js";
+import {
+  finalizeTsharkWithDns,
+  parseCapinfosOutput,
+  prepareTsharkBaseOutput,
+} from "./PcapOutput.js";
 
-const capture = (layers: ReadonlyArray<Record<string, string[]>>) =>
+const readTsharkFields = async (stdout: string, dnsStdout?: string) => {
+  const base = await prepareTsharkBaseOutput(stdout);
+  return dnsStdout === undefined
+    ? base.fallback
+    : finalizeTsharkWithDns(base, dnsStdout);
+};
+
+const capture = (layers: ReadonlyArray<Record<string, unknown>>) =>
   JSON.stringify(
     layers.map((fields, index) => ({
       _source: {
@@ -15,337 +28,6 @@ const capture = (layers: ReadonlyArray<Record<string, string[]>>) =>
       },
     })),
   );
-
-// Representative selected-field output for one A reply with a CNAME answer
-// and unrelated additional glue. This is not a recorded real-provider run.
-const cnameAndGlue = {
-  "dns.flags.response": ["1"],
-  "dns.qry.name": ["www.example"],
-  "dns.qry.type": ["1"],
-  "dns.qry.class": ["0x0001"],
-  "dns.count.queries": ["1"],
-  "dns.count.answers": ["2"],
-  "dns.count.auth_rr": ["0"],
-  "dns.count.add_rr": ["1"],
-  "dns.resp.name": ["www.example", "edge.example", "ns.example"],
-  "dns.resp.type": ["5", "1", "1"],
-  "dns.resp.class": ["0x0001", "0x0001", "0x0001"],
-  "dns.cname": ["edge.example"],
-  "dns.a": ["192.0.2.10", "192.0.2.53"],
-};
-
-// Source-backed selected-field shape: Wireshark 4.x add_rr_to_tree emits
-// dns.srv.* instead of dns.resp.name for SRV owners. Not a provider recording.
-// https://github.com/wireshark/wireshark/blob/v4.4.10/epan/dissectors/packet-dns.c#L1926-L1976
-const srvAndAddresses = {
-  "dns.flags.response": ["1"],
-  "dns.qry.name": ["WWW.Example"],
-  "dns.qry.type": ["255"],
-  "dns.qry.class": ["0x0001"],
-  "dns.count.queries": ["1"],
-  "dns.count.answers": ["4"],
-  "dns.count.auth_rr": ["0"],
-  "dns.count.add_rr": ["1"],
-  "dns.resp.type": ["33", "1", "33", "28", "1"],
-  "dns.resp.class": ["0x0001", "0x0001", "0x0001", "0x0001", "0x0001"],
-  "dns.resp.name": ["www.example", "www.example", "ns.example"],
-  "dns.a": ["192.0.2.10", "192.0.2.53"],
-  "dns.aaaa": ["2001:db8::10"],
-};
-
-it("keeps address-free SRV answers complete without requiring dns.resp.name", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      {
-        ...srvAndAddresses,
-        "dns.qry.name": ["_sip._tcp.example"],
-        "dns.qry.type": ["33"],
-        "dns.qry.class": ["0x0001"],
-        "dns.count.answers": ["1"],
-        "dns.count.add_rr": ["0"],
-        "dns.resp.type": ["33"],
-        "dns.resp.class": ["0x0001"],
-        "dns.resp.name": [],
-        "dns.a": [],
-        "dns.aaaa": [],
-      },
-    ]),
-  );
-  expect(result.partial).toBe(false);
-  expect(result.dnsQueries[0]?.response_addresses).toEqual([]);
-});
-
-it("aligns A and AAAA owners around SRV records while retaining additional glue separately", async () => {
-  const result = await parseTsharkJsonOutput(capture([srvAndAddresses]));
-  expect(result.dnsQueries).toEqual([
-    {
-      query: "WWW.Example",
-      response_addresses: ["192.0.2.10", "2001:db8::10"],
-      response_address_count: 2,
-    },
-  ]);
-  expect(result.unattributedDnsAddresses).toEqual(["192.0.2.53"]);
-  expect(result.partial).toBe(true);
-});
-
-it.each([
-  { "dns.resp.name": ["www.example", "ns.example"] },
-  {
-    "dns.resp.name": [
-      "srv.example",
-      "www.example",
-      "www.example",
-      "ns.example",
-    ],
-  },
-  { "dns.resp.type": ["33", "1", "33", "28"] },
-  { "dns.count.answers": ["4", "0"] },
-  { "dns.flags.response": ["1", "1"] },
-])("declines ambiguous SRV owner inventories: %j", async (override) => {
-  const result = await parseTsharkJsonOutput(
-    capture([{ ...srvAndAddresses, ...override }]),
-  );
-  expect(result.dnsQueries[0]?.response_addresses).toEqual([]);
-  expect(result.unattributedDnsAddresses).toEqual([
-    "192.0.2.10",
-    "192.0.2.53",
-    "2001:db8::10",
-  ]);
-  expect(result.partial).toBe(true);
-});
-
-it("retains exact nonempty DNS questions when response ownership is unresolved", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      {
-        "dns.flags.response": ["1"],
-        "dns.qry.name": ["", "WWW.Example", "www.example", "WWW.Example"],
-        "dns.a": ["192.0.2.10"],
-      },
-    ]),
-  );
-  expect(result.dnsQueries).toEqual([
-    { query: "WWW.Example", response_addresses: [], response_address_count: 0 },
-    { query: "www.example", response_addresses: [], response_address_count: 0 },
-  ]);
-  expect(result.dnsQueryCount).toBe(2);
-  expect(result.unattributedDnsAddresses).toEqual(["192.0.2.10"]);
-  expect(result.partial).toBe(true);
-});
-
-it("reports unknown RR coverage when a DNS response omits all count and address fields", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      {
-        "dns.flags.response": ["1"],
-        "dns.qry.name": ["www.example"],
-      },
-    ]),
-  );
-  expect(result.dnsQueries[0]?.response_addresses).toEqual([]);
-  expect(result.unattributedDnsAddresses).toEqual([]);
-  expect(result.partial).toBe(true);
-});
-
-it("keeps a query with an additional OPT record complete", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      {
-        ...cnameAndGlue,
-        "dns.flags.response": ["0"],
-        "dns.count.answers": ["0"],
-        "dns.resp.name": [""],
-        "dns.resp.type": ["41"],
-        "dns.resp.class": [],
-        "dns.cname": [],
-        "dns.a": [],
-      },
-    ]),
-  );
-  expect(result.partial).toBe(false);
-});
-
-it("preserves a CNAME answer while separating additional glue", async () => {
-  const result = await parseTsharkJsonOutput(capture([cnameAndGlue]));
-  expect(result.dnsQueries).toEqual([
-    {
-      query: "www.example",
-      response_addresses: ["192.0.2.10"],
-      response_address_count: 1,
-    },
-  ]);
-  expect(result.unattributedDnsAddresses).toEqual(["192.0.2.53"]);
-  expect(result.unattributedDnsPackets).toBe(1);
-  expect(result.partial).toBe(true);
-});
-
-it("accepts hexadecimal RR type codes without changing recorded identities", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      {
-        ...cnameAndGlue,
-        "dns.qry.type": ["0x0001"],
-        "dns.qry.class": ["0x0001"],
-        "dns.resp.type": ["0x0005", "0x0001", "0x0001"],
-        "dns.resp.class": ["0x0001", "0x0001", "0x0001"],
-      },
-    ]),
-  );
-  expect(result.dnsQueries[0]?.response_addresses).toEqual(["192.0.2.10"]);
-  expect(result.unattributedDnsAddresses).toEqual(["192.0.2.53"]);
-});
-
-it("retains direct answers with a root-owned OPT and compares DNS names without rewriting them", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      {
-        ...cnameAndGlue,
-        "dns.qry.name": ["WWW.Example"],
-        "dns.count.answers": ["1"],
-        "dns.resp.name": ["www.example", ""],
-        "dns.resp.type": ["1", "41"],
-        "dns.resp.class": ["0x0001"],
-        "dns.cname": [],
-        "dns.a": ["192.0.2.10"],
-      },
-    ]),
-  );
-  expect(result.dnsQueries).toEqual([
-    {
-      query: "WWW.Example",
-      response_addresses: ["192.0.2.10"],
-      response_address_count: 1,
-    },
-  ]);
-  expect(result.partial).toBe(false);
-});
-
-it("joins mixed answer types using their own queues and preserves multiple valid answers", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      {
-        ...cnameAndGlue,
-        "dns.qry.type": ["255"],
-        "dns.qry.class": ["0x0001"],
-        "dns.count.answers": ["5"],
-        "dns.count.add_rr": ["0"],
-        "dns.resp.name": [
-          "www.example",
-          "edge.example",
-          "edge.example",
-          "edge.example",
-          "edge.example",
-        ],
-        "dns.resp.type": ["5", "28", "1", "28", "1"],
-        "dns.resp.class": ["0x0001", "0x0001", "0x0001", "0x0001", "0x0001"],
-        "dns.a": ["192.0.2.10", "192.0.2.11"],
-        "dns.aaaa": ["2001:db8::10", "2001:db8::11"],
-      },
-    ]),
-  );
-  expect(result.dnsQueries[0]?.response_addresses).toEqual([
-    "2001:db8::10",
-    "192.0.2.10",
-    "2001:db8::11",
-    "192.0.2.11",
-  ]);
-  expect(result.partial).toBe(false);
-});
-
-it.each([
-  { "dns.resp.name": ["www.example", "unrelated.example", "ns.example"] },
-  { "dns.count.answers": ["1"], "dns.count.auth_rr": ["1"] },
-  { "dns.qry.type": ["28"] },
-  { "dns.flags.response": ["1", "1"] },
-  { "dns.count.answers": ["garbage"] },
-  { "dns.count.answers": ["4"] },
-  { "dns.count.answers": [] },
-  { "dns.resp.name": ["www.example"] },
-  { "dns.resp.type": ["5", "28", "1"] },
-  { "dns.cname": [] },
-  { "dns.cname": ["www.example"] },
-  { "dns.count.queries": ["2"] },
-  // NSEC/NXT type bitmaps can contribute additional dns.resp.type fields.
-  { "dns.resp.type": ["5", "1", "47", "1", "28"] },
-] as Record<string, string[]>[])(
-  "retains all addresses when ownership is unsupported or inconsistent: %j",
-  async (override) => {
-    const result = await parseTsharkJsonOutput(
-      capture([{ ...cnameAndGlue, ...override }]),
-    );
-    expect(result.dnsQueries[0]?.response_addresses).toEqual([]);
-    expect(result.unattributedDnsAddresses).toEqual([
-      "192.0.2.10",
-      "192.0.2.53",
-    ]);
-    expect(result.partial).toBe(true);
-  },
-);
-
-it("does not follow conflicting CNAME declarations", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      {
-        ...cnameAndGlue,
-        "dns.count.answers": ["4"],
-        "dns.count.add_rr": ["0"],
-        "dns.resp.name": [
-          "www.example",
-          "www.example",
-          "edge.example",
-          "other.example",
-        ],
-        "dns.resp.type": ["5", "5", "1", "1"],
-        "dns.resp.class": ["0x0001", "0x0001", "0x0001", "0x0001"],
-        "dns.cname": ["edge.example", "other.example"],
-      },
-    ]),
-  );
-  expect(result.dnsQueries[0]?.response_addresses).toEqual([]);
-  expect(result.unattributedDnsAddresses).toEqual(["192.0.2.10", "192.0.2.53"]);
-});
-
-it.each([
-  { "dns.a": [] },
-  { "dns.a": [], "dns.resp.name": [], "dns.resp.type": [] },
-])(
-  "marks missing address/owner decoding partial even when no addresses were extracted: %j",
-  async (override) => {
-    const result = await parseTsharkJsonOutput(
-      capture([{ ...cnameAndGlue, ...override }]),
-    );
-    expect(result.dnsQueries[0]?.response_addresses).toEqual([]);
-    expect(result.unattributedDnsAddresses).toEqual([]);
-    expect(result.partial).toBe(true);
-  },
-);
-
-it.each([
-  { "dns.count.answers": ["0"], "dns.resp.name": [], "dns.resp.type": [] },
-  {
-    "dns.count.answers": ["1"],
-    "dns.resp.name": ["www.example"],
-    "dns.resp.type": ["2"],
-    "dns.resp.class": ["0x0001"],
-  },
-])(
-  "keeps valid empty or non-address answers complete: %j",
-  async (override) => {
-    const result = await parseTsharkJsonOutput(
-      capture([
-        {
-          ...cnameAndGlue,
-          "dns.count.add_rr": ["0"],
-          "dns.cname": [],
-          "dns.a": [],
-          ...override,
-        },
-      ]),
-    );
-    expect(result.dnsQueries[0]?.response_addresses).toEqual([]);
-    expect(result.partial).toBe(false);
-  },
-);
 
 it.each([
   [[], []],
@@ -359,7 +41,7 @@ it.each([
 ] as const)(
   "counts every frame while aggregating only reported protocol stacks: %j",
   async (stacks, expected) => {
-    const result = await parseTsharkJsonOutput(
+    const result = await readTsharkFields(
       capture(stacks.map((stack) => ({ "frame.protocols": [stack] }))),
     );
     expect(result.packetCount).toBe(stacks.length);
@@ -380,7 +62,7 @@ it.each([
   { "frame.number": ["2"], "frame.protocols": [""] },
 ])("rejects malformed or ambiguous frame inventories: %j", async (layers) => {
   await expect(
-    parseTsharkJsonOutput(JSON.stringify([{ _source: { layers } }])),
+    readTsharkFields(JSON.stringify([{ _source: { layers } }])),
   ).rejects.toMatchObject({ _tag: "AnalysisProtocolError" });
 });
 
@@ -392,20 +74,9 @@ it.each(["before", "after"] as const)(
       "frame.protocols": ["eth:ethertype:ip:udp:dns"],
       "ip.src": ["192.0.2.53"],
       "ip.dst": ["192.0.2.1"],
-      "dns.qry.name": ["api.example"],
-      "dns.flags.response": ["True"],
-      "dns.a": ["203.0.113.5"],
-      "dns.qry.type": ["1"],
-      "dns.qry.class": ["0x0001"],
-      "dns.count.queries": ["1"],
-      "dns.count.answers": ["1"],
-      "dns.count.auth_rr": ["0"],
-      "dns.count.add_rr": ["0"],
-      "dns.resp.name": ["api.example"],
-      "dns.resp.type": ["1"],
-      "dns.resp.class": ["0x0001"],
+      ...dnsResponseLayers("api.example", "203.0.113.5"),
     };
-    const result = await parseTsharkJsonOutput(
+    const result = await readTsharkFields(
       capture(position === "before" ? [empty, response] : [response, empty]),
     );
     expect(result).toMatchObject({
@@ -423,6 +94,7 @@ it.each(["before", "after"] as const)(
       dnsQueries: [
         {
           query: "api.example",
+          query_labels_hex: ["617069", "6578616d706c65"],
           response_addresses: ["203.0.113.5"],
           response_address_count: 1,
         },
@@ -434,7 +106,7 @@ it.each(["before", "after"] as const)(
 
 it("rejects duplicate frame identities even when protocol stacks are empty", async () => {
   await expect(
-    parseTsharkJsonOutput(
+    readTsharkFields(
       capture([
         { "frame.protocols": [""] },
         { "frame.number": ["1"], "frame.protocols": [""] },
@@ -443,70 +115,60 @@ it("rejects duplicate frame identities even when protocol stacks are empty", asy
   ).rejects.toMatchObject({ _tag: "AnalysisProtocolError" });
 });
 
-it("binds interleaved DNS answers to the question in their response packet", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      { "dns.qry.name": ["alpha.example"], "dns.flags.response": ["False"] },
-      { "dns.qry.name": ["beta.example"], "dns.flags.response": ["False"] },
-      {
-        "dns.qry.name": ["alpha.example"],
-        "dns.flags.response": ["True"],
-        "dns.a": ["192.0.2.10"],
-        "dns.qry.type": ["1"],
-        "dns.qry.class": ["0x0001"],
-        "dns.count.queries": ["1"],
-        "dns.count.answers": ["1"],
-        "dns.count.auth_rr": ["0"],
-        "dns.count.add_rr": ["0"],
-        "dns.resp.name": ["alpha.example"],
-        "dns.resp.type": ["1"],
-        "dns.resp.class": ["0x0001"],
-      },
-      {
-        "dns.qry.name": ["beta.example"],
-        "dns.flags.response": ["True"],
-        "dns.a": ["192.0.2.20"],
-        "dns.qry.type": ["1"],
-        "dns.qry.class": ["0x0001"],
-        "dns.count.queries": ["1"],
-        "dns.count.answers": ["1"],
-        "dns.count.auth_rr": ["0"],
-        "dns.count.add_rr": ["0"],
-        "dns.resp.name": ["beta.example"],
-        "dns.resp.type": ["1"],
-        "dns.resp.class": ["0x0001"],
-      },
-    ]),
-  );
+it("marks a TC response partial without losing its observed DNS answer", async () => {
+  const layers = dnsResponseLayers("api.example", "203.0.113.5");
+  const bytes = Buffer.from(layers.dns_raw[0] as string, "hex");
+  bytes.writeUInt16BE(0x8380, 2);
+  layers.dns_raw[0] = bytes.toString("hex");
+  const result = await readTsharkFields(capture([layers]));
   expect(result.dnsQueries).toEqual([
     {
-      query: "alpha.example",
-      response_addresses: ["192.0.2.10"],
+      query: "api.example",
+      query_labels_hex: ["617069", "6578616d706c65"],
+      response_addresses: ["203.0.113.5"],
       response_address_count: 1,
     },
-    {
-      query: "beta.example",
-      response_addresses: ["192.0.2.20"],
-      response_address_count: 1,
-    },
+  ]);
+  expect(result.partial).toBe(true);
+  expect(result.dnsLimitations).toContain(
+    "DNS message declares truncation (TC); captured records are incomplete",
+  );
+});
+
+it("binds interleaved DNS answers to each response packet", async () => {
+  const result = await readTsharkFields(
+    capture([
+      dnsResponseLayers("alpha.example", "192.0.2.10"),
+      dnsResponseLayers("beta.example", "192.0.2.20"),
+    ]),
+  );
+  expect(
+    result.dnsQueries.map(({ query, response_addresses }) => ({
+      query,
+      response_addresses,
+    })),
+  ).toEqual([
+    { query: "alpha.example", response_addresses: ["192.0.2.10"] },
+    { query: "beta.example", response_addresses: ["192.0.2.20"] },
   ]);
   expect(result.partial).toBe(false);
 });
 
-it("retains unassignable DNS addresses without inventing a query relationship", async () => {
-  const result = await parseTsharkJsonOutput(
+it("retains unassignable DNS observations when wire identity is missing", async () => {
+  const result = await readTsharkFields(
     capture([
-      {
-        "dns.qry.name": ["alpha.example", "beta.example"],
-        "dns.flags.response": ["True"],
-        "dns.a": ["192.0.2.9"],
-      },
-      { "dns.flags.response": ["True"], "dns.aaaa": ["2001:db8::9"] },
+      { dns: { "dns.qry.name": ["same", "same"], "dns.a": "192.0.2.9" } },
+      { dns: { "dns.aaaa": "2001:db8::9" } },
     ]),
   );
-  expect(
-    result.dnsQueries.every((query) => query.response_addresses.length === 0),
-  ).toBe(true);
+  expect(result.dnsQueries).toEqual(
+    Array(2).fill({
+      query: "same",
+      query_labels_hex: null,
+      response_addresses: [],
+      response_address_count: 0,
+    }),
+  );
   expect(result.unattributedDnsAddresses).toEqual(["192.0.2.9", "2001:db8::9"]);
   expect(result.unattributedDnsPackets).toBe(2);
   expect(result.partial).toBe(true);
@@ -519,7 +181,7 @@ it("counts IPv6 endpoints once per packet and preserves every examined fact", as
     "tls.handshake.extensions_server_name": [`host${String(index)}.example`],
     "frame.protocols": [`ipv6:protocol${String(index)}`],
   }));
-  const result = await parseTsharkJsonOutput(capture(packets));
+  const result = await readTsharkFields(capture(packets));
   expect(result.endpoints).toEqual([
     { address: "2001:db8::1", port: null, packet_count: 51 },
   ]);
@@ -532,7 +194,7 @@ it("counts IPv6 endpoints once per packet and preserves every examined fact", as
 
 it("orders equal-count endpoints and protocols by code point, not host locale", async () => {
   // Locale collation puts "fe80::1" first and, under da-DK, "aarp" after "zz".
-  const result = await parseTsharkJsonOutput(
+  const result = await readTsharkFields(
     capture([
       { "ipv6.src": ["fe80::1"], "frame.protocols": ["eth:llc:zz"] },
       { "ipv6.src": ["fe80:1::1"], "frame.protocols": ["eth:llc:aarp"] },
@@ -549,21 +211,10 @@ it("orders equal-count endpoints and protocols by code point, not host locale", 
 });
 
 it("preserves all DNS addresses and their exact examined count", async () => {
-  const result = await parseTsharkJsonOutput(
+  const result = await readTsharkFields(
     capture(
       Array.from({ length: 101 }, (_, index) => ({
-        "dns.qry.name": ["rotating.example"],
-        "dns.flags.response": ["True"],
-        "dns.a": [`192.0.2.${String(index)}`],
-        "dns.qry.type": ["1"],
-        "dns.qry.class": ["0x0001"],
-        "dns.count.queries": ["1"],
-        "dns.count.answers": ["1"],
-        "dns.count.auth_rr": ["0"],
-        "dns.count.add_rr": ["0"],
-        "dns.resp.name": ["rotating.example"],
-        "dns.resp.type": ["1"],
-        "dns.resp.class": ["0x0001"],
+        ...dnsResponseLayers("rotating.example", `192.0.2.${String(index)}`),
       })),
     ),
   );
@@ -601,7 +252,7 @@ it.each([
 );
 
 it("excludes transport credentials without normalizing observed URL bytes", async () => {
-  const result = await parseTsharkJsonOutput(
+  const result = await readTsharkFields(
     capture([
       {
         "http.request.full_uri": [
@@ -624,7 +275,7 @@ it("excludes transport credentials without normalizing observed URL bytes", asyn
 });
 
 it("retains HTTP absolute-form request targets when Wireshark cannot synthesize full_uri", async () => {
-  const result = await parseTsharkJsonOutput(
+  const result = await readTsharkFields(
     capture([
       { "http.request.uri": ["http://proxy.example.test/a/../resource"] },
       { "http.request.uri": ["/relative/path"] },
@@ -638,7 +289,7 @@ it("retains HTTP absolute-form request targets when Wireshark cannot synthesize 
 });
 
 it("marks mixed request arrays partial when a relative target has no full URI", async () => {
-  const result = await parseTsharkJsonOutput(
+  const result = await readTsharkFields(
     capture([
       {
         "http.request.uri": ["/resolved/with-host", "/unresolved/without-host"],
@@ -653,7 +304,7 @@ it("marks mixed request arrays partial when a relative target has no full URI", 
 });
 
 it("accounts for paired full URIs and absolute-form values without inventing array joins", async () => {
-  const result = await parseTsharkJsonOutput(
+  const result = await readTsharkFields(
     capture([
       {
         "http.request.uri": ["/first", "/second", "http://proxy.example/third"],
@@ -675,9 +326,32 @@ it("accounts for paired full URIs and absolute-form values without inventing arr
 
 it("refuses dense JSON before its expanded graph exceeds the decoding budget", async () => {
   await expect(
-    parseTsharkJsonOutput(`[${"{},".repeat(600_000)}{}]`),
+    readTsharkFields(`[${"{},".repeat(600_000)}{}]`),
   ).rejects.toMatchObject({
     _tag: "AnalysisResourceConstraintError",
+    fixedAllowance: {
+      name: "The tshark JSON expansion allowance",
+      limit: 128 * 1024 ** 2,
+      unit: "bytes",
+    },
+  });
+});
+
+it("refuses packet facts above the retained-fact budget with its value", async () => {
+  // Each distinct endpoint charges 192 bytes plus twice its length, so 80,000
+  // short endpoints (about 2 MiB of JSON) exceed the 16 MiB budget.
+  const sources = Array.from({ length: 80_000 }, (_, index) =>
+    String(index).padStart(16, "0"),
+  );
+  await expect(
+    readTsharkFields(capture([{ "ip.src": sources }])),
+  ).rejects.toMatchObject({
+    _tag: "AnalysisResourceConstraintError",
+    fixedAllowance: {
+      name: "The packet-inventory retained-fact allowance",
+      limit: 16 * 1024 ** 2,
+      unit: "bytes",
+    },
   });
 });
 
@@ -689,7 +363,7 @@ it.each([
   "preserves opaque cancellation while validating producer output: %s",
   async (reason) => {
     const controller = new AbortController();
-    const result = parseTsharkJsonOutput(
+    const result = prepareTsharkBaseOutput(
       capture([{ "ip.src": ["192.0.2.1"] }]),
       controller.signal,
     );
@@ -706,7 +380,7 @@ it.each([
 );
 
 it("includes decoded HTTP/2 URIs with shared credential handling and reports unresolved targets", async () => {
-  const full = await parseTsharkJsonOutput(
+  const full = await readTsharkFields(
     capture([
       {
         "http2.request.full_uri": [
@@ -728,85 +402,246 @@ it("includes decoded HTTP/2 URIs with shared credential handling and reports unr
   expect(full.partial).toBe(false);
   expect(
     (
-      await parseTsharkJsonOutput(
+      await readTsharkFields(
         capture([{ "http2.headers.path": ["/unresolved"] }]),
       )
     ).partial,
   ).toBe(true);
 });
 
-// Wireshark 4.4.10 emits dns.aaaa without a class guard, and uses masked
-// dns.qry.class/dns.resp.class for mDNS. These are source-backed fixtures,
-// not recorded provider runs.
-// https://github.com/wireshark/wireshark/blob/v4.4.10/epan/dissectors/packet-dns.c#L3022-L3030
-// https://github.com/wireshark/wireshark/blob/v4.4.10/epan/dissectors/packet-dns.c#L6265-L6308
-const classedAddressReply = {
-  "dns.flags.response": ["1"],
-  "dns.qry.name": ["host.example"],
-  "dns.qry.type": ["28"],
-  "dns.qry.class": ["0x0001"],
-  "dns.count.queries": ["1"],
-  "dns.count.answers": ["1"],
-  "dns.count.auth_rr": ["0"],
-  "dns.count.add_rr": ["0"],
-  "dns.resp.name": ["host.example"],
-  "dns.resp.type": ["28"],
-  "dns.resp.class": ["0x0001"],
-  "dns.aaaa": ["2001:db8::9"],
-};
-
-it.each([
-  { "dns.qry.class": ["0x0003"] },
-  { "dns.qry.class": [] },
-  { "dns.qry.class": ["invalid"] },
-  { "dns.qry.class": ["1", "1"] },
-  { "dns.resp.class": ["0x0003"] },
-  { "dns.resp.class": [] },
-  { "dns.resp.class": ["invalid"] },
-  { "dns.resp.class": ["1", "1"] },
-])(
-  "retains addresses with unsupported or unknown DNS classes: %j",
-  async (override) => {
-    const result = await parseTsharkJsonOutput(
-      capture([{ ...classedAddressReply, ...override }]),
-    );
-    expect(result.dnsQueries[0]?.response_addresses).toEqual([]);
-    expect(result.unattributedDnsAddresses).toEqual(["2001:db8::9"]);
-    expect(result.partial).toBe(true);
-  },
-);
-
-it("does not follow a CNAME from another DNS class", async () => {
-  const result = await parseTsharkJsonOutput(
-    capture([
-      { ...cnameAndGlue, "dns.resp.class": ["0x0003", "0x0001", "0x0001"] },
-    ]),
+// Extracted unchanged frame, DNS and raw DNS fields from Wireshark 4.4.19
+// -T json -x --no-duplicate-keys -J "frame ip ipv6 dns tls http http2".
+// Locally generated five-frame capture: UDP, multiple TCP PDUs and reassembly.
+// Other protocol trees and packet metadata are omitted; no external traffic.
+it("parses recorded Wireshark raw trees without merging display-colliding names", async () => {
+  const output = await readFile(
+    new URL("../../tests/fixtures/pcap/dns-raw-tree.json", import.meta.url),
+    "utf8",
   );
-  expect(result.dnsQueries[0]?.response_addresses).toEqual([]);
-  expect(result.unattributedDnsAddresses).toEqual(["192.0.2.10", "192.0.2.53"]);
-  expect(result.partial).toBe(true);
+  const result = await readTsharkFields(output);
+  expect(result.packetCount).toBe(5);
+  expect(result.dnsQueries).toEqual([
+    {
+      query: "a.b.example",
+      query_labels_hex: ["612e62", "6578616d706c65"],
+      response_addresses: ["192.0.2.9"],
+      response_address_count: 1,
+    },
+    {
+      query: "a.b.example",
+      query_labels_hex: ["61", "62", "6578616d706c65"],
+      response_addresses: ["192.0.2.9"],
+      response_address_count: 1,
+    },
+  ]);
+  expect(result.partial).toBe(false);
 });
 
-it.each(["0x0001", "0x00ff"])(
-  "accepts IN answers for question class %s around OPT and SRV",
-  async (questionClass) => {
-    const result = await parseTsharkJsonOutput(
-      capture([
-        {
-          ...classedAddressReply,
-          "frame.protocols": ["ip:udp:mdns"],
-          "dns.qry.class": [questionClass],
-          "dns.qry.qu": ["1"],
-          "dns.resp.cache_flush": ["1", "0"],
-          "dns.count.answers": ["3"],
-          "dns.resp.type": ["41", "33", "28"],
-          "dns.resp.name": ["", "host.example"],
-          "dns.resp.class": ["0x0001", "0x0001"],
+it("shares the decoded-graph allowance across base and DNS acquisitions", async () => {
+  // Each graph is individually within 128 MiB using the decoder's conservative
+  // source expansion accounting; together they must fail before the second parse.
+  const padding = Array<string>(360_000).fill("");
+  const base = capture([{ padding }]);
+  const dns = JSON.stringify([
+    {
+      _source: {
+        layers: {
+          frame: { "frame.number": "1", "frame.protocols": "ip:udp" },
+          padding,
         },
-      ]),
+      },
+    },
+  ]);
+  await expect(readTsharkFields(base)).resolves.toMatchObject({
+    packetCount: 1,
+  });
+  await expect(readTsharkFields(dns)).resolves.toMatchObject({
+    packetCount: 1,
+  });
+  await expect(readTsharkFields(base, dns)).rejects.toMatchObject({
+    _tag: "AnalysisResourceConstraintError",
+    fixedAllowance: { limit: 128 * 1024 ** 2, unit: "bytes" },
+  });
+});
+
+it.each(["dns", "mdns", "llmnr"] as const)(
+  "joins recorded %s message facts without dropping its DNS identity",
+  async (family) => {
+    const recorded: {
+      _source: {
+        layers: Record<string, unknown> & { frame: Record<string, string> };
+      };
+    }[] = JSON.parse(
+      await readFile(
+        new URL(
+          "../../tests/fixtures/pcap/dns-family-tree.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
     );
-    expect(result.dnsQueries[0]?.response_addresses).toEqual(["2001:db8::9"]);
-    expect(result.unattributedDnsAddresses).toEqual([]);
+    if (!Array.isArray(recorded)) throw new Error("Expected producer packets");
+    const packet = recorded.find((packet) => family in packet._source.layers);
+    if (packet === undefined)
+      throw new Error("Expected matching producer family");
+    packet._source.layers.frame["frame.number"] = "1";
+    const result = await readTsharkFields(
+      capture([{ "dns.qry.name": ["a.example"], "dns.a": ["192.0.2.9"] }]),
+      JSON.stringify([packet]),
+    );
+    expect(result.dnsQueries).toEqual([
+      {
+        query: "a.example",
+        query_labels_hex: ["61", "6578616d706c65"],
+        response_addresses: ["192.0.2.9"],
+        response_address_count: 1,
+      },
+    ]);
     expect(result.partial).toBe(false);
   },
 );
+
+it("preserves selected occurrences omitted by a partial DNS message pass", async () => {
+  const raw = dnsResponseLayers("same.example", "192.0.2.9");
+  const base = capture([
+    {
+      "dns.qry.name": ["same.example", "same.example", "missing.example"],
+      "dns.a": ["192.0.2.9", "192.0.2.9", "192.0.2.10"],
+    },
+  ]);
+  const tree = JSON.stringify([
+    { _source: { layers: { frame: { "frame.number": "1" }, ...raw } } },
+  ]);
+  const result = await readTsharkFields(base, tree);
+  expect(result.dnsQueries).toEqual([
+    {
+      query: "same.example",
+      query_labels_hex: ["73616d65", "6578616d706c65"],
+      response_addresses: ["192.0.2.9"],
+      response_address_count: 1,
+    },
+    {
+      query: "same.example",
+      query_labels_hex: null,
+      response_addresses: [],
+      response_address_count: 0,
+    },
+    {
+      query: "missing.example",
+      query_labels_hex: null,
+      response_addresses: [],
+      response_address_count: 0,
+    },
+  ]);
+  expect(result.unattributedDnsAddresses).toEqual(["192.0.2.9", "192.0.2.10"]);
+  expect(result.unattributedDnsPackets).toBe(1);
+  expect(result.partial).toBe(true);
+  expect(result.dnsLimitations.join(" ")).toContain("occurrences");
+});
+
+it("still reconciles selected DNS facts when embedded messages report unattributed addresses", async () => {
+  const base = capture([
+    {
+      "dns.qry.name": ["tree.example", "missing.example"],
+      "dns.a": ["192.0.2.1", "192.0.2.2"],
+    },
+  ]);
+  const tree = JSON.stringify([
+    {
+      _source: {
+        layers: {
+          frame: { "frame.number": "1" },
+          dns: {
+            Queries: { question: { "dns.qry.name": "tree.example" } },
+            Answers: { answer: { "dns.a": "192.0.2.1" } },
+          },
+        },
+      },
+    },
+  ]);
+  const expectedQueries = [
+    {
+      query: "tree.example",
+      query_labels_hex: null,
+      response_addresses: [],
+      response_address_count: 0,
+    },
+    {
+      query: "missing.example",
+      query_labels_hex: null,
+      response_addresses: [],
+      response_address_count: 0,
+    },
+  ];
+  const result = await readTsharkFields(base, tree);
+  expect(result.dnsQueries).toEqual(expectedQueries);
+  expect(result.unattributedDnsAddresses).toEqual(["192.0.2.1", "192.0.2.2"]);
+  expect(result.unattributedDnsPackets).toBe(1);
+  expect(result.partial).toBe(true);
+});
+
+it("handles unique HTTP request targets beyond the cache limit without dropping resolution checks", async () => {
+  const packets = Array.from({ length: 1100 }, (_, index) => ({
+    "http.request.uri": [`http://example.test/u/${String(index)}`],
+    "http.request.full_uri": [`http://example.test/u/${String(index)}`],
+  }));
+  packets.push({
+    "http.request.uri": ["relative-without-slash"],
+    "http.request.full_uri": [],
+  });
+  const result = await readTsharkFields(capture(packets));
+  expect(result.httpRequestUriCount).toBe(1100);
+  expect(result.partial).toBe(true);
+});
+
+it("reports hasDnsProtocol only when base dissection sees DNS, mDNS, or LLMNR traffic or fields", async () => {
+  expect(
+    (
+      await prepareTsharkBaseOutput(
+        capture([{ "frame.protocols": ["eth:ethertype:ip:tcp:tls"] }]),
+      )
+    ).hasDnsProtocol,
+  ).toBe(false);
+  for (const stack of [
+    "eth:ethertype:ip:udp:dns",
+    "eth:ethertype:ip:udp:mdns",
+    "eth:ethertype:ip:udp:llmnr",
+  ]) {
+    expect(
+      (await prepareTsharkBaseOutput(capture([{ "frame.protocols": [stack] }])))
+        .hasDnsProtocol,
+    ).toBe(true);
+  }
+  expect(
+    (
+      await prepareTsharkBaseOutput(
+        capture([
+          {
+            "frame.protocols": ["eth:ethertype:ip:udp"],
+            "dns.qry.name": ["example.com"],
+          },
+        ]),
+      )
+    ).hasDnsProtocol,
+  ).toBe(true);
+});
+
+it("refuses tshark JSON above producer_limits.output_bytes and admits it when raised", async () => {
+  const text = capture([{ "ip.src": ["192.0.2.1"] }]);
+  await expect(
+    prepareTsharkBaseOutput(text, undefined, text.length - 1),
+  ).rejects.toMatchObject({
+    _tag: "AnalysisResourceConstraintError",
+    fixedAllowance: undefined,
+    limit: {
+      control_kind: "parameter",
+      parameter: "producer_limits.output_bytes",
+      effective_value: text.length - 1,
+      maximum: 128 * 1024 * 1024,
+      default_value: 8 * 1024 * 1024,
+    },
+  });
+  await expect(
+    prepareTsharkBaseOutput(text, undefined, text.length),
+  ).resolves.toMatchObject({ fallback: { endpointCount: 1 } });
+});

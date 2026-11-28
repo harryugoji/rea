@@ -4,7 +4,7 @@ import { z } from "zod";
 import {
   gpuCodeObjectsSchema,
   gpuCodeObjectsObjectSchema,
-  gpuCodeObjectsSelectionSchema,
+  gpuCodeObjectsSelectionSchemas,
   gpuObjectSchema,
   gpuKernelSchema,
   gpuTargetSchema,
@@ -12,15 +12,21 @@ import {
   type GpuCodeObjects,
 } from "../gpu/gpuCodeObjects.js";
 import type { AnalysisError } from "../analysisErrorBase.js";
-import type {
-  AnalysisViewParent,
-  AnalysisViewRequest,
-  UnsignedAnalysisView,
-} from "./analysisView.js";
-import { analysisViewInputError } from "./analysisViewErrors.js";
+import { filterSet } from "./selectViewRows.js";
+import type { AnalysisViewParent } from "./analysisViewParent.js";
+import {
+  ownedView,
+  type AdmittedView,
+  type SummaryAnalysisView,
+} from "./analysisViewShape.js";
+import {
+  ANALYSIS_VIEW_PAGE_BUDGET_RECOVERY,
+  invalidAnalysisViewSubject,
+  invalidAnalysisView,
+} from "./analysisViewErrors.js";
 import { createAnalysisViewResultReader } from "./analysisViewParent.js";
 import {
-  boundedViewMessages,
+  boundedViewLimitations,
   completeWithinViewCoverage,
   pageViewCoverage,
 } from "./analysisViewCoverage.js";
@@ -28,19 +34,20 @@ import { err, ok, type Result } from "../result.js";
 import type { JsonValue } from "../jsonValue.js";
 import { jsonValueByteLength } from "../jsonValueByteLength.js";
 import { AnalysisResourceConstraintError } from "../analysisErrorCore.js";
+import { evidenceFileTarget } from "../evidence.js";
 export const gpuCodeObjectsViewRequestSchema = z.discriminatedUnion(
   "collection",
   [
-    gpuCodeObjectsSelectionSchema.options[0].extend({
+    gpuCodeObjectsSelectionSchemas.objects.extend({
       kind: z.literal("gpu-code-objects"),
     }),
-    gpuCodeObjectsSelectionSchema.options[1].extend({
+    gpuCodeObjectsSelectionSchemas.kernels.extend({
       kind: z.literal("gpu-code-objects"),
     }),
-    gpuCodeObjectsSelectionSchema.options[2].extend({
+    gpuCodeObjectsSelectionSchemas.ptx.extend({
       kind: z.literal("gpu-code-objects"),
     }),
-    gpuCodeObjectsSelectionSchema.options[3].extend({
+    gpuCodeObjectsSelectionSchemas.targets.extend({
       kind: z.literal("gpu-code-objects"),
     }),
   ],
@@ -193,35 +200,23 @@ const readGpuFacts = (
     };
     if (reusable) checkedGpu.set(report, checked);
   }
-  const subject = parent.subject;
-  if (
-    subject != null &&
-    subject.digest.sha256 !== checked.report.artifact.sha256
-  )
-    return err(
-      analysisViewInputError([
-        {
-          path: ["source", "subject"],
-          reason: "invalid_value",
-          message: "GPU Evidence subject does not match its recorded artifact",
-        },
-      ]),
+  const subject = evidenceFileTarget(parent);
+  if (subject != null && subject.sha256 !== checked.report.artifact.sha256)
+    return invalidAnalysisViewSubject(
+      "GPU Evidence subject does not match its recorded artifact",
     );
   return ok(checked);
 };
 export const projectGpuCodeObjectsView = (
   parent: AnalysisViewParent,
-  view: AnalysisViewRequest,
-): Result<UnsignedAnalysisView, AnalysisError> => {
-  if (view.kind !== "summary" && view.kind !== "gpu-code-objects")
-    return err(
-      analysisViewInputError([
-        {
-          path: ["view"],
-          reason: "invalid_value",
-          message: "GPU Evidence supports summary and gpu-code-objects pages",
-        },
-      ]),
+  admitted: AdmittedView,
+) => {
+  const view = ownedView<
+    SummaryAnalysisView | z.output<typeof gpuCodeObjectsViewRequestSchema>
+  >(admitted, "summary", "gpu-code-objects");
+  if (view === undefined)
+    return invalidAnalysisView(
+      "GPU Evidence supports summary and gpu-code-objects pages",
     );
   const parsed = readGpuFacts(parent);
   if (!parsed.ok) return parsed;
@@ -231,11 +226,7 @@ export const projectGpuCodeObjectsView = (
     parent_operation: "inspect_gpu_code_objects" as const,
     parent_digest: parent.evidenceId.slice(3),
     artifact: { path: report.artifact.path, sha256: report.artifact.sha256 },
-    limitations: boundedViewMessages(
-      [...parent.limitations, ...report.limitations],
-      parent.evidenceId,
-      "limitations",
-    ),
+    limitations: boundedViewLimitations(parent, report.limitations),
     unknowns: [
       "GPU execution, runtime compatibility and host launch sites were not inspected.",
       ...(report.coverage.payloads !== "complete"
@@ -247,14 +238,11 @@ export const projectGpuCodeObjectsView = (
   };
   if (view.kind === "summary") {
     return ok({
-      kind: "summary",
+      kind: "summary" as const,
       view,
       ...shared,
       summary: { ...summary, limitations: shared.limitations },
-      coverage: completeWithinViewCoverage(
-        report.objects.length,
-        report.objects.length,
-      ),
+      coverage: completeWithinViewCoverage(report.objects.length),
     });
   }
   if (view.collection === "ptx") {
@@ -262,15 +250,9 @@ export const projectGpuCodeObjectsView = (
       (row) => row.object_id === view.object_id,
     );
     if (artifact === undefined)
-      return err(
-        analysisViewInputError([
-          {
-            path: ["view", "object_id"],
-            reason: "invalid_value",
-            message:
-              "No retained PTX artifact exists for this object; inspect a selected PTX payload with analysis kernels",
-          },
-        ]),
+      return invalidAnalysisView(
+        "No retained PTX artifact exists for this object; inspect a selected PTX payload with analysis kernels",
+        "object_id",
       );
     const end = Math.min(artifact.text.length, view.offset + view.limit);
     const split = (offset: number): boolean =>
@@ -279,15 +261,8 @@ export const projectGpuCodeObjectsView = (
       /[\uD800-\uDBFF]/u.test(artifact.text[offset - 1]!) &&
       /[\uDC00-\uDFFF]/u.test(artifact.text[offset]!);
     if (split(view.offset) || split(end))
-      return err(
-        analysisViewInputError([
-          {
-            path: ["view"],
-            reason: "invalid_value",
-            message:
-              "PTX text page must end and start on Unicode scalar boundaries; offsets use UTF-16 code units",
-          },
-        ]),
+      return invalidAnalysisView(
+        "PTX text page must end and start on Unicode scalar boundaries; offsets use UTF-16 code units",
       );
     const text = artifact.text.slice(view.offset, end);
     if (jsonValueByteLength(text, 1024 * 1024) > 1024 * 1024)
@@ -297,10 +272,11 @@ export const projectGpuCodeObjectsView = (
           "memory",
           "PTX page exceeds the 1 MiB response budget; lower limit",
           { maximum_page_bytes: 1024 * 1024 },
+          ANALYSIS_VIEW_PAGE_BUDGET_RECOVERY,
         ),
       );
     return ok({
-      kind: "gpu-code-objects",
+      kind: "gpu-code-objects" as const,
       view,
       ...shared,
       source_coverage: report.coverage,
@@ -312,7 +288,7 @@ export const projectGpuCodeObjectsView = (
         byte_length: artifact.byte_length,
         text,
         offset: view.offset,
-        offset_unit: "utf16-code-unit",
+        offset_unit: "utf16-code-unit" as const,
       },
       coverage: pageViewCoverage(
         view.offset,
@@ -321,9 +297,8 @@ export const projectGpuCodeObjectsView = (
       ),
     });
   }
-  const targets =
-    view.targets === undefined ? undefined : new Set(view.targets);
-  const ids = view.ids === undefined ? undefined : new Set(view.ids);
+  const targets = filterSet(view.targets);
+  const ids = filterSet(view.ids);
   const objectIds =
     view.collection === "kernels" && view.object_ids !== undefined
       ? new Set(view.object_ids)
@@ -403,10 +378,11 @@ export const projectGpuCodeObjectsView = (
         "memory",
         "GPU page exceeds the 1 MiB response budget; select fewer fields or rows",
         { maximum_page_bytes: 1024 * 1024 },
+        ANALYSIS_VIEW_PAGE_BUDGET_RECOVERY,
       ),
     );
   return ok({
-    kind: "gpu-code-objects",
+    kind: "gpu-code-objects" as const,
     view,
     ...shared,
     source_coverage: report.coverage,
